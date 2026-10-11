@@ -1,0 +1,247 @@
+# This workflow installs the latest version of Terraform CLI and configures the Terraform CLI configuration file
+# with an API token for Terraform Cloud (app.terraform.io). On pull request events, this workflow will run
+# `terraform init`, `terraform fmt`, and `terraform plan` (speculative plan via Terraform Cloud). On push events
+# to the "main" branch, `terraform apply` will be executed.
+#
+# Documentation for `hashicorp/setup-terraform` is located here: https://github.com/hashicorp/setup-terraform
+#
+# To use this workflow, you will need to complete the following setup steps.
+#
+# 1. Create a `main.tf` file in the root of this repository with the `remote` backend and one or more resources defined.
+#   Example `main.tf`:
+#     # The configuration for the `remote` backend.
+#     terraform {
+#       backend "remote" {
+#         # The name of your Terraform Cloud organization.
+#         organization = "example-organization"
+#
+#         # The name of the Terraform Cloud workspace to store Terraform state files in.
+#         workspaces {
+#           name = "example-workspace"
+#         }
+#       }
+#     }
+#
+#     # An example resource that does nothing.
+#     resource "null_resource" "example" {
+#       triggers = {
+#         value = "A example resource import os, shutil
+
+base = '/mnt/agents/output/football-odds-analyzer'
+os.makedirs(f'{base}/static', exist_ok=True)
+
+# ---------- analyzer.py ----------
+analyzer = '''"""football-odds-analyzer: analysis engine (pure Python, no dependencies)."""
+from math import exp, factorial
+
+def implied_probabilities(home, draw, away):
+    raw = {"home": 1/home, "draw": 1/draw, "away": 1/away}
+    total = sum(raw.values())
+    fair = {k: v/total for k, v in raw.items()}
+    return {"raw": raw, "overround": total - 1.0, "fair": fair,
+            "fair_odds": {k: 1.0/v for k, v in fair.items()}}
+
+def _pois(lam, k):
+    return exp(-lam) * lam**k / factorial(k)
+
+def estimate_xg(fair, total_goals=2.7):
+    """Baseline expected goals from market fair probs (home advantage applied)."""
+    strength_home = fair["home"] + 0.5 * fair["draw"]
+    home_xg = total_goals * strength_home * 1.08
+    away_xg = total_goals * (1 - strength_home) * 0.95
+    return round(max(0.2, home_xg), 2), round(max(0.15, away_xg), 2)
+
+def poisson_match_probs(home_xg, away_xg, max_goals=10):
+    p = [[_pois(home_xg, i) * _pois(away_xg, j) for j in range(max_goals+1)]
+         for i in range(max_goals+1)]
+    h = sum(p[i][j] for i in range(max_goals+1) for j in range(max_goals+1) if i > j)
+    d = sum(p[i][j] for i in range(max_goals+1) for j in range(max_goals+1) if i == j)
+    a = sum(p[i][j] for i in range(max_goals+1) for j in range(max_goals+1) if i < j)
+    flat = sorted([(p[i][j], i, j) for i in range(max_goals+1) for j in range(max_goals+1)], reverse=True)
+    return {"home": h, "draw": d, "away": a,
+            "top_scores": [{"score": f"{i}-{j}", "prob": round(pr, 4)} for pr, i, j in flat[:3]]}
+
+def analyze_match(home_odds, draw_odds, away_odds):
+    info = implied_probabilities(home_odds, draw_odds, away_odds)
+    xg_h, xg_a = estimate_xg(info["fair"])
+    model = poisson_match_probs(xg_h, xg_a)
+    edges = {k: model[k] - info["fair"][k] for k in ("home", "draw", "away")}
+    best = max(edges, key=edges.get)
+    return {
+        "best_odds": {"home": home_odds, "draw": draw_odds, "away": away_odds},
+        "margin": round(info["overround"], 4),
+        "fair": {k: round(v, 4) for k, v in info["fair"].items()},
+        "xg": {"home": xg_h, "away": xg_a},
+        "model": {k: round(model[k], 4) for k in ("home", "draw", "away")},
+        "top_scores": model["top_scores"],
+        "edges": {k: round(v, 4) for k, v in edges.items()},
+        "best_value": {"outcome": best, "edge": round(edges[best], 4)} if edges[best] > 0.03 else None,
+    }
+'''
+open(f'{base}/analyzer.py', 'w').write(analyzer)
+
+# ---------- main.py ----------
+main = '''"""football-odds-analyzer: FastAPI backend.
+Run:  uvicorn main:app --reload --port 8000
+Live odds require a free key from https://the-odds-api.com set as
+the environment variable ODDS_API_KEY. Without it, the app serves
+realistic simulated data so you can develop the full UI for free.
+"""
+import os, time, random
+from fastapi import FastAPI, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+import httpx
+from analyzer import analyze_match
+
+API_KEY = os.getenv("ODDS_API_KEY", "").strip()
+app = FastAPI(title="Football odds analyzer")
+
+SPORTS = {
+    "soccer_epl": "Premier League",
+    "soccer_spain_la_liga": "La Liga",
+    "soccer_germany_bundesliga": "Bundesliga",
+    "soccer_italy_serie_a": "Serie A",
+    "soccer_france_ligue_one": "Ligue 1",
+    "soccer_uefa_champs_league": "Champions League",
+}
+REGIONS = {"uk", "us", "eu", "au"}
+
+# Simulated feed (used when no API key is set) - odds drift over time
+DEMO_MATCHES = [
+    {"home_team": "Arsenal", "away_team": "Chelsea", "base": (1.85, 3.60, 4.40)},
+    {"home_team": "Real Madrid", "away_team": "Sevilla", "base": (1.45, 4.60, 7.20)},
+    {"home_team": "Bayern Munich", "away_team": "Dortmund", "base": (1.70, 4.10, 4.60)},
+    {"home_team": "Inter", "away_team": "Napoli", "base": (2.30, 3.30, 3.20)},
+    {"home_team": "PSG", "away_team": "Marseille", "base": (1.60, 4.00, 5.50)},
+]
+
+def demo_odds():
+    t = time.time()
+    out = []
+    for i, m in enumerate(DEMO_MATCHES):
+        drift = 1 + 0.04 * __import__("math").sin(t / 240 + i * 1.7)  # slow drift
+        j = lambda x: round(max(1.02, x * drift * random.uniform(0.985, 1.015)), 2)
+        h, d, a = (j(m["base"][0]), j(m["base"][1]), j(m["base"][2]))
+        kickoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t + 3600 * (24 + i * 26)))
+        out.append({"id": f"demo-{i}", "home_team": m["home_team"],
+                    "away_team": m["away_team"], "commence_time": kickoff,
+                    "bookmaker": "Demo book (simulated)", **analyze_match(h, d, a)})
+    return out
+
+@app.get("/api/config")
+def config():
+    return {"demo": not API_KEY, "sports": SPORTS, "regions": sorted(REGIONS)}
+
+@app.get("/api/odds")
+async def odds(sport: str = Query("soccer_epl"), region: str = Query("eu")):
+    if not API_KEY:
+        return {"demo": True, "updated": time.time(), "matches": demo_odds()}
+    url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
+    params = {"apiKey": API_KEY, "regions": region, "markets": "h2h"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+    matches = []
+    for ev in data:
+        best = {}
+        bk = ""
+        for book in ev.get("bookmakers", []):
+            for mkt in book.get("markets", []):
+                if mkt.get("key") != "h2h":
+                    continue
+                for o in mkt.get("outcomes", []):
+                    name = "home" if o["name"] == ev["home_team"] else \
+                           "away" if o["name"] == ev["away_team"] else "draw"
+                    if name not in best or o["price"] > best[name]:
+                        best[name] = o["price"]; bk = book.get("title", "")
+        if len(best) == 3:
+            matches.append({"id": ev["id"], "home_team": ev["home_team"],
+                            "away_team": ev["away_team"],
+                            "commence_time": ev["commence_time"],
+                            "bookmaker": bk, **analyze_match(best["home"], best["draw"], best["away"])})
+    return {"demo": False, "updated": time.time(), "matches": matches}
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+def index():
+    return FileResponse("static/index.html")
+'''
+open(f'{base}/main.py', 'w').write(main)
+
+# ---------- requirements.txt ----------
+open(f'{base}/requirements.txt', 'w').write("fastapi\nuvicorn\nhttpx\n")
+
+# ---------- .env.example ----------
+open(f'{base}/.env.example', 'w').write(
+    "# Copy to .env (or set as a Codespace secret). Free key: https://the-odds-api.com\n"
+    "ODDS_API_KEY=your_key_here\n")
+
+print("backend files written") does nothing!"
+#       }
+#     }
+#
+#
+# 2. Generate a Terraform Cloud user API token and store it as a GitHub secret (e.g. TF_API_TOKEN) on this repository.
+#   Documentation:
+#     - https://www.terraform.io/docs/cloud/users-teams-organizations/api-tokens.html
+#     - https://help.github.com/en/actions/configuring-and-managing-workflows/creating-and-storing-encrypted-secrets
+#
+# 3. Reference the GitHub secret in step using the `hashicorp/setup-terraform` GitHub Action.
+#   Example:
+#     - name: Setup Terraform
+#       uses: hashicorp/setup-terraform@v1
+#       with:
+#         cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+name: 'Terraform'
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: 'Terraform'
+    runs-on: ubuntu-latest
+    environment: production
+
+    # Use the Bash shell regardless whether the GitHub Actions runner is ubuntu-latest, macos-latest, or windows-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    # Checkout the repository to the GitHub Actions runner
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # Install the latest version of Terraform CLI and configure the Terraform CLI configuration file with a Terraform Cloud user API token
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v1
+      with:
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+    # Initialize a new or existing Terraform working directory by creating initial files, loading any remote state, downloading modules, etc.
+    - name: Terraform Init
+      run: terraform init
+
+    # Checks that all Terraform configuration files adhere to a canonical format
+    - name: Terraform Format
+      run: terraform fmt -check
+
+    # Generates an execution plan for Terraform
+    - name: Terraform Plan
+      run: terraform plan -input=false
+
+      # On push to "main", build or change infrastructure according to Terraform configuration files
+      # Note: It is recommended to set up a required "strict" status check in your repository for "Terraform Cloud". See the documentation on "strict" required status checks for more information: https://help.github.com/en/github/administering-a-repository/types-of-required-status-checks
+    - name: Terraform Apply
+      if: github.ref == 'refs/heads/"main"' && github.event_name == 'push'
+      run: terraform apply -auto-approve -input=false
